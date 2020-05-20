@@ -4,8 +4,6 @@
     Build: make
     Run: ./main 3
     (here 3 is the number of OpenMP threads)
-
-    syntax checked with vera++
 */
 
 #include <stdio.h>
@@ -29,8 +27,8 @@ const int MAX_RANDOM_NUM = 1e7;
 int random_arr_fill(int* arr, int arr_size); // Fill array with random numbers <= MAX_RANDOM_NUM
 
 // Sequential merge sort
-int  merge(int* arr1, int* arr2, int* res, int arr1_size, int arr2_size);
-int  seq_merge_sort(int* arr, int arr_size);
+int merge(int* arr1, int* arr2, int* res, int arr1_size, int arr2_size);
+int seq_merge_sort(int* arr, int arr_size);
 
 // Merge sort variant that uses OMP sections mechanism
 int sections_par_merge_sort(int* arr, int arr_size, int threads_num);
@@ -38,6 +36,10 @@ int sections_par_merge_sort(int* arr, int arr_size, int threads_num);
 // Merge sort variant that uses OMP tasks mechanism
 const int MIN_TASK_SIZE = 100;
 int tasks_par_merge_sort(int* arr, int arr_size, int min_task_size);
+
+// Merge sort variant that uses hypercube architecture reduce
+int hcube_reduce(int* arr, int arr_size, int rank, int world_size, int merge_size);
+int hcube_par_merge_sort(int* arr, const int arr_size);
 
 // Perform time trials of the merge sort variants
 // ( prints merge sort variants execution time on max_thr_num threads
@@ -74,7 +76,8 @@ int main(int argc, char** argv)
         print_arr(arr5, arr5_size);
 
         //sections_par_merge_sort(arr5, arr5_size, 3);
-        tasks_par_merge_sort(arr5, arr5_size, MIN_TASK_SIZE);
+        //tasks_par_merge_sort(arr5, arr5_size, MIN_TASK_SIZE);
+        //hcube_par_merge_sort(arr5, arr5_size);
 
         print_arr(arr5, arr5_size);
     }
@@ -236,18 +239,21 @@ int tasks_par_merge_sort(int* arr, int arr_size, int min_task_size)
     return 0;
 }
 
+
 // all-to-one using hypercube topology
-int hcube_reduce(int* arr, int arr_size, int rank, int world_size, int merge_size)
+int hcube_reduce(int* arr, int rank, int world_size, int merge_size)
 {
     int hcube_dim = floor(log2(world_size));
     int mask = 0, partner = 0;
     int hcube_nodes_num = int_pow(2, hcube_dim);
 
     int i_pow_2 = 1;
-    MPI_Status partner_status;
+    //MPI_Status partner_status;
+    int new_arr_size = 0;
 
     for (int i = 0; i < hcube_dim; ++i, i_pow_2 *= 2)
     {
+        #pragma omp barrier
 
         // we can't just exit the function for extra threads since we have barriers
         if (rank >= hcube_nodes_num)
@@ -256,26 +262,17 @@ int hcube_reduce(int* arr, int arr_size, int rank, int world_size, int merge_siz
         }
 
         partner = rank ^ i_pow_2;
+        new_arr_size = merge_size * i_pow_2;
 
         if ((rank & mask) == 0 && (rank & i_pow_2) == 0)
         {
-            arr_decomposition(partner, hcube_nodes_num, arr_size, &start_i, &size_i);
+            int* res_arr = (int*) calloc(new_arr_size * 2, sizeof(int));
 
-            MPI_Probe(partner, MSG_TAG, MPI_COMM_WORLD, &partner_status);
-            MPI_Get_count(&partner_status, MPI_INT, &size_i);
-
-            MPI_Recv(arr + start_i, size_i, MPI_INT, partner, RECV_PAR);
-
-            int* res_arr = (int*) calloc(size_p + size_i, sizeof(int));
-
-            merge(arr + start_p, arr + start_i, res_arr, size_p, size_i);
-            size_p += size_i;
-            start_p = 0; // quick fix
-
-            for (int j = start_p; j < size_p; ++j)
-                arr[j] = res_arr[j - start_p];
+            merge (&arr[merge_size * rank], &arr[merge_size * partner], res_arr, new_arr_size, new_arr_size);
+            memcpy(&arr[merge_size * rank], res_arr, sizeof(int) * new_arr_size * 2);
 
             free(res_arr);
+            res_arr = NULL;
         }
 
         mask = mask ^ i_pow_2;
@@ -283,43 +280,72 @@ int hcube_reduce(int* arr, int arr_size, int rank, int world_size, int merge_siz
 
     #pragma omp barrier
 
+    const int ROOT = 0;
+    // merge the last part to the root process
+    if (rank != ROOT)
+    {
+        for (int i = hcube_nodes_num; i < world_size; i++)
+        {
+            int* res_arr = (int*) calloc(merge_size * (i + 1), sizeof(int));
+
+            merge(arr, &arr[merge_size * i], res_arr, merge_size * i, merge_size);
+            memcpy(arr, res_arr, sizeof(int) * merge_size * (i + 1));
+
+            free(res_arr);
+        }
+    }
+
     #pragma omp barrier
 
     return 0;
 }
 
-int hcube_par_merge_sort(int * a, const int na)
+int hcube_par_merge_sort(int* arr, const int arr_size)
 {
+    int max_thr_num = omp_get_max_threads();
 
-    int nt = omp_get_max_threads();
-    int min = INT_MAX;
-    for (int i = 0; i < na; ++i) if (a[i] < min) min = a[i];
-
-    int bar = na + (nt - na % nt) % nt;
-    int * b = (int *) calloc(bar, sizeof(int));
-    memcpy(b, a, na * sizeof(int));
-    for (int i = na; i < bar; ++i) {
-        b[i] = min - (i + 1 - na);
+    // find min el in the array
+    int min_arr_el = arr[0];
+    for (int i = 1; i < arr_size; ++i)
+    {
+        if (arr[i] < min_arr_el)
+        {
+            min_arr_el = arr[i];
+        }
     }
 
-    int part_size = bar / nt;
+    // we sort the padded array, so each proc would get arrays of equal length
+    // (=> equal array merges in hcube_reduce)
+    int padded_arr_size = arr_size + (max_thr_num - arr_size % max_thr_num) % max_thr_num;
+    int* padded_arr = (int*) calloc(padded_arr_size, sizeof(int));
+    memcpy(padded_arr, arr, arr_size * sizeof(int));
+
+    // the array is padded with numbers that are < the min array number,
+    // so we can throw the extra number after the sort
+    for (int i = arr_size; i < padded_arr_size; ++i)
+    {
+        padded_arr[i] = min_arr_el - (i + 1 - arr_size);
+    }
+
+    assert(max_thr_num > 0);
+    // average number of elements to sort per process
+    int delta = padded_arr_size / max_thr_num;
 
     #pragma omp parallel
     {
-
         int rank = omp_get_thread_num();
         int size = omp_get_num_threads();
 
-
-        merge_sort(&b[part_size * rank], part_size);
+        seq_merge_sort(&padded_arr[delta * rank], delta);
         #pragma omp barrier
-        hcube_reduce(b, rank, size, part_size);
+        hcube_reduce(padded_arr, rank, size, delta);
 
         #pragma omp single
-        memcpy(a, &b[(size - na % size) % size], na * sizeof(int));
+        memcpy(arr, &padded_arr[(size - arr_size % size) % size], arr_size * sizeof(int));
     }
 
-    free(b);
+    free(padded_arr);
+    padded_arr = NULL;
 
     return 0;
 }
@@ -343,7 +369,7 @@ int random_arr_fill(int* arr, int arr_size)
 int omp_timer_run(int thr_num, const char* fname, int arr_size)
 {
     double start = 0.0;
-    double t_sect = 0.0, t_task = 0.0;
+    double t_sect = 0.0, t_task = 0.0, t_cube = 0.0;
     int* arr = (int*) calloc(arr_size, sizeof(int));
     random_arr_fill(arr, arr_size);
 
@@ -354,7 +380,7 @@ int omp_timer_run(int thr_num, const char* fname, int arr_size)
                                                  omp_get_max_threads());
 
     start = omp_get_wtime();
-    omp_set_nested(1);
+    //omp_set_nested(1); // libgomp: Thread creation failed: Resource temporarily unavailable
     sections_par_merge_sort(arr, arr_size, thr_num);
     t_sect = omp_get_wtime() - start;
 
@@ -369,13 +395,18 @@ int omp_timer_run(int thr_num, const char* fname, int arr_size)
     }
     t_task = omp_get_wtime() - start;
 
-    printf("p = %d  t_sect = %lg  t_task = %lg\n", thr_num, t_sect, t_task);
+    random_arr_fill(arr, arr_size);
+    start = omp_get_wtime();
+    hcube_par_merge_sort(arr, arr_size);
+    t_cube = omp_get_wtime() - start;
+
+    printf("p = %d  t_sect = %lg  t_task = %lg  t_cube = %lg\n", thr_num, t_sect, t_task, t_cube);
 
     FILE* time_file = fopen(fname, "a+");
 
     if (time_file != NULL)
     {
-        fprintf(time_file, "%d %lg %lg\n", thr_num, t_sect, t_task);
+        fprintf(time_file, "%d %lg %lg %lg\n", thr_num, t_sect, t_task, t_cube);
         fclose(time_file);
         time_file = NULL;
     }

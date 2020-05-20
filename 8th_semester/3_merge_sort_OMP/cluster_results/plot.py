@@ -10,6 +10,7 @@ def plot_execution_time(filename):
     proc_num  = []
     exec_time_sect = []
     exec_time_task = []
+    exec_time_cube = []
 
     with open(filename, 'r') as csvfile:
         plots = csv.reader(csvfile, delimiter=' ')
@@ -17,6 +18,7 @@ def plot_execution_time(filename):
             proc_num.append(int(row[0]))
             exec_time_sect.append(float(row[1]))
             exec_time_task.append(float(row[2]))
+            exec_time_cube.append(float(row[3]))
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8.27, 11.69))
 
@@ -54,12 +56,14 @@ def plot_execution_time(filename):
     ax1.set_title (r'Dependence of the execution time on the number of threads (merge sort)', fontsize=titlesize)
     ax1.plot(proc_num, exec_time_sect, **params, label='parallel (sections)')
     ax1.plot(proc_num, exec_time_task, **params, label='parallel (tasks)')
+    ax1.plot(proc_num, exec_time_cube, **params, label='parallel (hypercube)')
 
     ax2.set_xlabel(r'Threads', fontsize=labelsize)
-    ax2.set_ylabel(r'Speedup',    fontsize=labelsize)
+    ax2.set_ylabel(r'Speedup', fontsize=labelsize)
     ax2.set_title (r'Dependence of the speedup time on the number of threds',    fontsize=titlesize)
     ax2.plot(proc_num, np.divide(exec_time_sect[0], exec_time_sect), **params, label='parallel (sections)')
     ax2.plot(proc_num, np.divide(exec_time_task[0], exec_time_task), **params, label='parallel (tasks)')
+    ax2.plot(proc_num, np.divide(exec_time_cube[0], exec_time_cube), **params, label='parallel (hypercube)')
 
     ax1.legend()
     ax2.legend()

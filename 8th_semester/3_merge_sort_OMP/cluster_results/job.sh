@@ -6,8 +6,6 @@
 cd $PBS_O_WORKDIR
 export OMP_NUM_THREADS=$PBS_NUM_PPN
 
-rm merge_sort_cluster_speed.txt -f ; \
-for thr_num in 1 2 3 4; do \
-    echo "thr_num = $thr_num"; \ 
+for thr_num in 1 2 3 4 5 6 7 8; do \
     ./main $thr_num; \
 done
